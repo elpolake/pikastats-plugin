@@ -1,0 +1,5 @@
+name: "PikaStats"
+version: "1.0.0"
+author: "PikaStats"
+main: "dev.PikaStats.PikaStatsPlugin"
+min-version: "3.4.13"
