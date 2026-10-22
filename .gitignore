@@ -1,0 +1,8 @@
+.gradle/
+build/
+libs/*.jar
+*.class
+*.log
+.env
+.env.*
+overlay.properties

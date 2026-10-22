@@ -1,0 +1,33 @@
+plugins {
+    id 'java-library'
+}
+
+group = 'dev.PikaStats'
+version = '1.0.0'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_17
+    targetCompatibility = JavaVersion.VERSION_17
+}
+
+repositories {
+    mavenCentral()
+}
+
+def viaProxyJar = providers.gradleProperty('viaproxyJar')
+    .orElse(providers.environmentVariable('VIAPROXY_JAR'))
+    .orElse('libs/ViaProxy-3.4.14.jar')
+
+dependencies {
+    // ViaProxy provides these classes at runtime, so they must not be bundled.
+    compileOnly files(viaProxyJar.get())
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 17
+}
+
+tasks.named('jar') {
+    archiveBaseName = 'PikaStats'
+}
