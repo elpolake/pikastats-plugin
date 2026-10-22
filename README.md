@@ -28,6 +28,11 @@ fallback-mode=QUADS
 
 You can set the environment variable **PIKA_STATS_API_KEY** before starting ViaProxy instead. It takes precedence over the key in the properties file.
 
+The other properties are:
+
+- **websocket-port** selects the local port for the overlay feed. It defaults to **8765** and must be in the range 1024 to 65535.
+- **fallback-mode** selects the BedWars mode used by the overlay if ViaProxy cannot identify the current mode. Set it to **SOLO**, **DOUBLES**, **TRIPLES**, or **QUADS**; the default is **QUADS**.
+
 ## Commands
 
 Commands are typed in Minecraft chat. Results are sent to public chat, so do not include your API key in a command.
@@ -55,7 +60,7 @@ Modes:
 - **3** - triples
 - **4** - quads
 
-Available stat selectors are **summary**, **wins**, **losses**, **final_kills**, **final_deaths**, **kills**, **deaths**, **fkdr**, **wlr**, and **kdr**. Hyphens can replace underscores. Singular forms such as **win**, **kill**, and **death** are accepted; final-kill and final-death aliases are accepted too.
+If you omit the stat selector, the plugin returns a summary. Selectors are **wins** or **win**, **losses** or **loss**, **final_kills** or **final_kill**, **final_deaths** or **final_death**, **kills** or **kill**, **deaths** or **death**, **fkdr**, **wlr**, and **kdr**. Final-kill aliases **final**, **finals**, **finalkill**, and **finalkills** are also accepted; final-death aliases **finaldeath** and **finaldeaths** are accepted. Hyphens can replace underscores.
 
 Examples:
 
