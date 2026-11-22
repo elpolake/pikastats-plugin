@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import shutil
 import socket
 import subprocess
@@ -781,6 +782,65 @@ def write_api_keys(settings: dict, keys: list[str]) -> None:
     config.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+API_KEY_PATTERN = re.compile(r"(?<![A-Za-z0-9_])[A-Za-z0-9]{2,10}_[A-Za-z0-9]{20,64}(?![A-Za-z0-9_])")
+
+
+def clipboard_text() -> str:
+    """Text on the Windows clipboard ("" when there is none or it is busy)."""
+    if not WINDOWS:
+        return ""
+    import ctypes
+    user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+    user32.GetClipboardData.restype = ctypes.c_void_p
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    if not user32.OpenClipboard(None):
+        return ""
+    try:
+        handle = user32.GetClipboardData(13)  # CF_UNICODETEXT
+        pointer = kernel32.GlobalLock(handle) if handle else None
+        if not pointer:
+            return ""
+        try:
+            return ctypes.wstring_at(pointer)[:4096]
+        finally:
+            kernel32.GlobalUnlock(handle)
+    finally:
+        user32.CloseClipboard()
+
+
+def flash_window() -> None:
+    """Blinks this console in the taskbar, so the player sees the setup moved on."""
+    if WINDOWS:
+        import ctypes
+        window = ctypes.windll.kernel32.GetConsoleWindow()
+        if window:
+            ctypes.windll.user32.FlashWindow(window, True)
+
+
+def getkey_or_clipboard(prompt: str, skip: set[str]) -> tuple[str, str | None]:
+    """Like getkey, but also returns as soon as an API key (not in skip) is copied anywhere.
+    Returns (key pressed, None) or ("", api key)."""
+    if not WINDOWS:
+        return getkey(prompt), None
+    import msvcrt
+    print(prompt, end="", flush=True)
+    while True:
+        if msvcrt.kbhit():
+            key = msvcrt.getwch()
+            if key in ("\x00", "\xe0"):
+                msvcrt.getwch()
+                continue
+            print()
+            return key.lower(), None
+        match = API_KEY_PATTERN.search(clipboard_text())
+        if match and match.group(0) not in skip:
+            print()
+            return "", match.group(0)
+        time.sleep(0.25)
+
+
 def test_api_key(key: str) -> str:
     status, _ = api_get("https://stats.pika-network.net/api/profile/Notch", key)
     if status in (200, 400, 404):
@@ -792,12 +852,35 @@ def test_api_key(key: str) -> str:
     return f"could not check (HTTP {status or 'no connection'})"
 
 
+def add_api_key(settings: dict, keys: list[str], value: str) -> bool:
+    """Tests and saves a key. False when it does not look like a key or PikaNetwork rejects it."""
+    value = value.strip().strip('"')
+    if len(value) < 8 or " " in value:
+        print(f"  {RED}[x]{RESET} that does not look like an API key")
+        return False
+    print(f"  {GRAY}checking the key with PikaNetwork...{RESET}")
+    result = test_api_key(value)
+    if result == "invalid":
+        print(f"  {RED}[x]{RESET} PikaNetwork rejected that key - check it and try again")
+        return False
+    if value not in keys:
+        keys.append(value)
+    write_api_keys(settings, keys)
+    print(f"  {GREEN}[✓]{RESET} key saved ({result})")
+    return True
+
+
 def api_keys_menu(settings: dict, theme: Theme, first_run: bool = False) -> None:
     keys = api_keys(settings)
+    # Keys already handled are not picked up from the clipboard again.
+    seen: set[str] = set(keys)
     while True:
         rule(theme, "API KEYS")
         print(f"  {GRAY}PikaStats needs a free PikaNetwork API key to look up stats.{RESET}")
-        print(f"  {GRAY}Get one: join play.pika-network.net and type {RESET}{BOLD}/apikey{RESET}{GRAY} in chat, then copy it.{RESET}")
+        print(f"  {GRAY}Get one: join play.pika-network.net and type {RESET}{BOLD}/apikey{RESET}{GRAY} in chat.{RESET}")
+        if WINDOWS:
+            print(f"  {GREEN}Just copy the key{RESET}{GRAY} (Ctrl+C) - this window picks it up by itself, you do not need to"
+                  f" come back here.{RESET}")
         print(f"  {GRAY}Each key allows ~120 lookups per minute; add keys from more accounts for more.{RESET}\n")
         for index, key in enumerate(keys, 1):
             masked = key[:4] + "••••••" + key[-4:] if len(key) > 8 else "****"
@@ -806,20 +889,18 @@ def api_keys_menu(settings: dict, theme: Theme, first_run: bool = False) -> None
             print(f"  {YELLOW}no keys yet{RESET}")
         print(f"\n  {theme.main}a{RESET} add key   {theme.main}r{RESET} remove key   {theme.main}t{RESET} test keys   "
               f"{theme.main}{'n' if first_run else 'b'}{RESET} {'continue' if first_run else 'back'}")
-        choice = getkey(f"\n  {theme.main}keys{RESET}> ")
-        if choice == "a":
-            value = ask(f"  paste your key (right-click pastes) > ").strip().strip('"')
-            if len(value) < 8 or " " in value:
-                print(f"  {RED}[x]{RESET} that does not look like an API key")
-                continue
-            result = test_api_key(value)
-            if result == "invalid":
-                print(f"  {RED}[x]{RESET} PikaNetwork rejected that key - check it and try again")
-                continue
-            if value not in keys:
-                keys.append(value)
-            write_api_keys(settings, keys)
-            print(f"  {GREEN}[✓]{RESET} key saved ({result})")
+        choice, copied = getkey_or_clipboard(f"\n  {theme.main}keys{RESET}> ", seen)
+        if copied:
+            seen.add(copied)
+            flash_window()
+            print(f"  {GREEN}[✓]{RESET} found a key on the clipboard: {copied[:4]}••••{copied[-4:]}")
+            if add_api_key(settings, keys, copied) and first_run:
+                return
+        elif choice == "a":
+            value = ask(f"  paste your key with Ctrl+V, then press Enter > ")
+            seen.add(value.strip().strip('"'))
+            if add_api_key(settings, keys, value) and first_run:
+                return
         elif choice == "r" and keys:
             index = ask("  number to remove > ")
             if index.isdigit() and 1 <= int(index) <= len(keys):
@@ -894,6 +975,18 @@ def run_setup(source: Path, theme: Theme) -> int:
     clear()
     banner(theme)
     target = INSTALL_DIR
+    lock = Path(os.environ.get("TEMP", str(target))) / "pikastats-setup.pid"
+    try:
+        other = int(lock.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        other = 0
+    running = other and other != os.getpid() and pid_alive(other) and (not WINDOWS or b"python" in subprocess.run(
+        ["tasklist", "/FI", f"PID eq {other}", "/NH"], capture_output=True).stdout.lower())
+    if running:
+        print(f"\n  {YELLOW}[!]{RESET} The PikaStats setup is already running in another window (process {other}).\n"
+              f"      Finish or close that one first (its X button, or end python.exe in Task Manager).")
+        return 1
+    lock.write_text(str(os.getpid()), encoding="utf-8")
     if WINDOWS and "WindowsApps" in sys.executable:
         # The Store build redirects AppData\Local into a private folder, so nothing would end up
         # where the launcher, shortcuts and overlay look for it.
