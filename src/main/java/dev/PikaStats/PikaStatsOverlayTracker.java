@@ -41,10 +41,13 @@ final class PikaStatsOverlayTracker {
     private static final int MAX_COMPONENT_LENGTH = 262_144;
     private static final int MAX_RETRIES = 3;
     private static final long REFRESH_INTERVAL_SECONDS = 10;
+    private static final long PUNISHMENT_REFRESH_INTERVAL_MILLIS = TimeUnit.MINUTES.toMillis(30);
 
-    private final PikaStatsApi api;
+    private final Services services;
     private final LocalWebSocketServer websocket;
     private final BedWarsMode fallbackMode;
+    private final java.util.function.Supplier<String> ownName;
+    private final java.util.function.Consumer<String> overlayHandler = this::onOverlayMessage;
     private final Map<UUID, String> tabPlayers = new LinkedHashMap<>();
     private final Map<UUID, String> knownPlayers = new HashMap<>();
     private final Map<String, PlayerState> players = new LinkedHashMap<>();
@@ -61,10 +64,11 @@ final class PikaStatsOverlayTracker {
     private boolean closed;
     private long gameGeneration;
 
-    PikaStatsOverlayTracker(PikaStatsApi api, LocalWebSocketServer websocket, BedWarsMode fallbackMode) {
-        this.api = api;
-        this.websocket = websocket;
-        this.fallbackMode = fallbackMode;
+    PikaStatsOverlayTracker(Services services, java.util.function.Supplier<String> ownName) {
+        this.services = services;
+        this.websocket = services.websocket();
+        this.fallbackMode = services.config().fallbackMode();
+        this.ownName = ownName;
         this.refreshScheduler = Executors.newSingleThreadScheduledExecutor(task -> {
             Thread thread = new Thread(task, "PikaStats-Overlay-Refresh");
             thread.setDaemon(true);
@@ -72,7 +76,7 @@ final class PikaStatsOverlayTracker {
         });
         this.refreshScheduler.scheduleWithFixedDelay(this::refreshPlayers, REFRESH_INTERVAL_SECONDS,
                 REFRESH_INTERVAL_SECONDS, TimeUnit.SECONDS);
-        this.websocket.setMessageHandler(this::onOverlayMessage);
+        this.websocket.addMessageHandler(this.overlayHandler);
     }
 
     private void onOverlayMessage(String payload) {
@@ -201,10 +205,13 @@ final class PikaStatsOverlayTracker {
         System.out.println("[PikaStats] Loading overlay details for " + name + " ("
                 + queryPeriod.displayName() + " " + queryMode.displayName() + ")");
 
-        CompletableFuture<LookupResult<StatsResult>> statsFuture = this.api
-                .lookup(new StatsRequest(name, queryPeriod, queryMode))
+        CompletableFuture<LookupResult<StatsResult>> statsFuture = this.services.api()
+                .lookup(new StatsRequest(name, queryPeriod, queryMode), ApiKeyPool.Priority.NORMAL)
                 .handle(LookupResult::new);
-        CompletableFuture<LookupResult<PunishmentsResult>> punishmentsFuture = this.api
+        CompletableFuture<LookupResult<ProfileResult>> profileFuture = this.services.api()
+                .lookupProfile(name, ApiKeyPool.Priority.NORMAL)
+                .handle(LookupResult::new);
+        CompletableFuture<LookupResult<PunishmentsResult>> punishmentsFuture = this.services.api()
                 .lookupPunishments(name)
                 .handle(LookupResult::new);
 
@@ -218,6 +225,11 @@ final class PikaStatsOverlayTracker {
                         + rootMessage(punishments.error()));
             }
             return buildPlayerDetails(name, requestId, queryMode, queryPeriod, stats, punishments);
+        }).thenCombine(profileFuture, (message, profile) -> {
+            if (profile.value() != null) {
+                message.add("profile", profileJson(profile.value()));
+            }
+            return message;
         }).whenComplete((message, error) -> {
             if (error != null) {
                 System.err.println("[PikaStats] Could not build overlay details for " + name + ": "
@@ -258,24 +270,35 @@ final class PikaStatsOverlayTracker {
         } else {
             StatsResult stats = statsLookup.value();
             JsonObject values = new JsonObject();
-            values.addProperty("canonicalUsername", stats.canonicalUsername());
-            values.addProperty("wins", stats.wins());
-            values.addProperty("losses", stats.losses());
-            values.addProperty("finalKills", stats.finalKills());
-            values.addProperty("finalDeaths", stats.finalDeaths());
-            values.addProperty("kills", stats.kills());
-            values.addProperty("deaths", stats.deaths());
-            values.addProperty("gamesPlayed", stats.gamesPlayed());
-            values.addProperty("bedsDestroyed", stats.bedsDestroyed());
-            values.addProperty("meleeKills", stats.meleeKills());
-            values.addProperty("bowKills", stats.bowKills());
-            values.addProperty("voidKills", stats.voidKills());
-            values.addProperty("arrowsShot", stats.arrowsShot());
-            values.addProperty("arrowsHit", stats.arrowsHit());
-            values.addProperty("highestWinStreakReached", stats.highestWinStreakReached());
-            values.addProperty("fkdr", stats.fkdr());
-            values.addProperty("wlr", stats.wlr());
-            values.addProperty("kdr", stats.kdr());
+            values.addProperty("canonicalUsername", stats.username());
+            values.addProperty("wins", stats.get(Stat.WINS));
+            values.addProperty("losses", stats.get(Stat.LOSSES));
+            values.addProperty("finalKills", stats.get(Stat.FINAL_KILLS));
+            values.addProperty("finalDeaths", stats.get(Stat.FINAL_DEATHS));
+            values.addProperty("kills", stats.get(Stat.KILLS));
+            values.addProperty("deaths", stats.get(Stat.DEATHS));
+            values.addProperty("gamesPlayed", stats.get(Stat.GAMES));
+            values.addProperty("bedsDestroyed", stats.get(Stat.BEDS));
+            values.addProperty("meleeKills", stats.get(Stat.MELEE_KILLS));
+            values.addProperty("bowKills", stats.get(Stat.BOW_KILLS));
+            values.addProperty("voidKills", stats.get(Stat.VOID_KILLS));
+            values.addProperty("arrowsShot", stats.get(Stat.ARROWS_SHOT));
+            values.addProperty("arrowsHit", stats.get(Stat.ARROWS_HIT));
+            values.addProperty("highestWinStreakReached", stats.get(Stat.WINSTREAK));
+            values.addProperty("fkdr", StatsResult.formatRatio(stats.fkdr()));
+            values.addProperty("wlr", StatsResult.formatRatio(stats.wlr()));
+            values.addProperty("kdr", StatsResult.formatRatio(stats.kdr()));
+            values.addProperty("bblr", StatsResult.formatRatio(stats.bblr()));
+            values.addProperty("winRate", stats.winRate());
+            values.addProperty("finalsPerGame", stats.finalsPerGame());
+            values.addProperty("bowAccuracy", stats.bowAccuracy());
+            JsonObject places = new JsonObject();
+            for (Stat stat : Stat.values()) {
+                if (stats.place(stat) > 0) {
+                    places.addProperty(stat.name(), stats.place(stat));
+                }
+            }
+            values.add("places", places);
             message.add("stats", values);
         }
 
@@ -295,12 +318,39 @@ final class PikaStatsOverlayTracker {
                 item.addProperty("type", entry.type());
                 item.addProperty("date", entry.date());
                 item.addProperty("reason", entry.reason());
+                item.addProperty("expires", entry.expires());
+                item.addProperty("active", entry.active());
                 entries.add(item);
             }
             values.add("entries", entries);
+            JsonArray active = new JsonArray();
+            for (PunishmentsResult.Entry entry : punishments.activePunishments()) {
+                JsonObject item = new JsonObject();
+                item.addProperty("type", entry.type());
+                item.addProperty("expires", entry.expires());
+                item.addProperty("reason", entry.reason());
+                active.add(item);
+            }
+            values.add("active", active);
             message.add("punishments", values);
         }
         return message;
+    }
+
+    private static JsonObject profileJson(ProfileResult profile) {
+        JsonObject json = new JsonObject();
+        json.addProperty("username", profile.username());
+        json.addProperty("level", profile.level());
+        json.addProperty("levelProgress", profile.levelProgress());
+        json.addProperty("levelTitle", profile.levelTitle());
+        json.addProperty("rank", profile.primaryRank());
+        json.addProperty("clan", profile.clanName());
+        json.addProperty("clanTag", profile.clanTag());
+        json.addProperty("clanLevel", profile.clanLevel());
+        json.addProperty("lastSeen", profile.lastSeenMillis());
+        json.addProperty("friends", profile.friends());
+        json.addProperty("discordVerified", profile.discordVerified());
+        return json;
     }
 
     private static String detailError(Throwable error, String fallback) {
@@ -349,12 +399,13 @@ final class PikaStatsOverlayTracker {
                 player.status = player.hasStats() ? "refreshing" : "loading";
                 player.retriesUsed = 0;
                 player.inFlight = false;
+                resetPunishmentState(player);
                 requests.add(player);
             }
             snapshot = buildMessage("game_update");
         }
         this.websocket.publish(snapshot, snapshot);
-        requests.forEach(this::requestPlayerStats);
+        requests.forEach(state -> requestPlayerStats(state, true));
     }
 
     void handlePacket(UnknownPacket packet, ProtocolVersion version) {
@@ -417,6 +468,7 @@ final class PikaStatsOverlayTracker {
             this.closed = true;
         }
         this.refreshScheduler.shutdownNow();
+        this.websocket.removeMessageHandler(this.overlayHandler);
     }
 
     private void handleLegacyPlayerInfo(byte[] packetData, ProtocolVersion version) throws Exception {
@@ -616,6 +668,7 @@ final class PikaStatsOverlayTracker {
                 state.requestedMode = this.mode;
                 state.requestedPeriod = this.period;
                 state.name = name;
+                resetPunishmentState(state);
                 return state;
             }
             state.id = id;
@@ -628,6 +681,12 @@ final class PikaStatsOverlayTracker {
     }
 
     private void requestPlayerStats(PlayerState state) {
+        requestPlayerStats(state, false);
+    }
+
+    private void requestPlayerStats(PlayerState state, boolean forceRefresh) {
+        requestPlayerPunishments(state);
+        requestPlayerProfile(state);
         String queryName;
         UUID queryId;
         BedWarsMode queryMode;
@@ -646,7 +705,11 @@ final class PikaStatsOverlayTracker {
             queryGeneration = state.generation;
         }
         StatsRequest request = new StatsRequest(queryName, queryPeriod, queryMode);
-        this.api.refresh(request).whenComplete((stats, error) -> {
+        // Background roster loading is low priority; the reload button counts as a click.
+        CompletableFuture<StatsResult> lookup = forceRefresh
+                ? this.services.api().refresh(request, ApiKeyPool.Priority.NORMAL)
+                : this.services.api().lookup(request, ApiKeyPool.Priority.LOW);
+        lookup.whenComplete((stats, error) -> {
             synchronized (PikaStatsOverlayTracker.this) {
                 PlayerState current = this.players.get(playerKey(queryName));
                 if (current == null || !current.id.equals(queryId) || current.generation != queryGeneration
@@ -656,15 +719,24 @@ final class PikaStatsOverlayTracker {
                 }
                 current.inFlight = false;
                 if (error == null) {
-                    current.name = stats.canonicalUsername();
-                    current.fkdr = parseRatio(stats.fkdr());
-                    current.wlr = parseRatio(stats.wlr());
-                    current.kdr = parseRatio(stats.kdr());
+                    current.name = stats.username();
+                    current.fkdr = stats.fkdr();
+                    current.wlr = stats.wlr();
+                    current.kdr = stats.kdr();
+                    current.finalKills = stats.get(Stat.FINAL_KILLS);
+                    current.wins = stats.get(Stat.WINS);
+                    current.beds = stats.get(Stat.BEDS);
+                    current.games = stats.get(Stat.GAMES);
+                    current.winstreak = stats.get(Stat.WINSTREAK);
+                    current.noGames = stats.isEmpty();
                     current.loadedMode = queryMode;
                     current.loadedPeriod = queryPeriod;
                     current.status = "ready";
                     current.retriesUsed = 0;
+                    current.nextStatsRetryAtMillis = 0;
                 } else {
+                    current.nextStatsRetryAtMillis = System.currentTimeMillis()
+                            + statsRetryDelayMillis(error, current.retriesUsed + 1);
                     if (current.retriesUsed < MAX_RETRIES) {
                         current.retriesUsed++;
                         current.status = "retrying";
@@ -680,15 +752,141 @@ final class PikaStatsOverlayTracker {
         });
     }
 
+    private void requestPlayerPunishments(PlayerState state) {
+        String queryName;
+        UUID queryId;
+        long requestId;
+        long now = System.currentTimeMillis();
+        synchronized (this) {
+            if (!this.inBedWarsGame || this.players.get(playerKey(state.name)) != state
+                    || state.punishmentsInFlight || this.closed
+                    || (state.punishmentsLoaded
+                    && now - state.punishmentsCheckedAt < PUNISHMENT_REFRESH_INTERVAL_MILLIS)) {
+                return;
+            }
+            state.punishmentsInFlight = true;
+            state.punishmentsCheckedAt = now;
+            state.punishmentRequestId++;
+            queryName = state.name;
+            queryId = state.id;
+            requestId = state.punishmentRequestId;
+        }
+        this.services.api().lookupActivePunishments(queryName).whenComplete((punishments, error) -> {
+            synchronized (PikaStatsOverlayTracker.this) {
+                PlayerState current = this.players.get(playerKey(queryName));
+                if (current == null || current != state || !current.id.equals(queryId)
+                        || current.punishmentRequestId != requestId || !this.inBedWarsGame) {
+                    return;
+                }
+                current.punishmentsInFlight = false;
+                current.punishmentsLoaded = true;
+                if (error == null) {
+                    current.activePunishments = punishments.activePunishments();
+                    current.punishmentsError = null;
+                } else {
+                    current.activePunishments = List.of();
+                    current.punishmentsError = detailError(error, "Punishments unavailable");
+                }
+            }
+            if (error != null) {
+                System.err.println("[PikaStats] Overlay punishments did not load for " + queryName + ": "
+                        + rootMessage(error));
+            }
+            publishPlayerUpdate();
+        });
+    }
+
+    private void requestPlayerProfile(PlayerState state) {
+        if (!this.services.config().overlayProfiles()) {
+            return;
+        }
+        String queryName;
+        synchronized (this) {
+            if (!this.inBedWarsGame || this.closed || state.profileRequested
+                    || this.players.get(playerKey(state.name)) != state) {
+                return;
+            }
+            state.profileRequested = true;
+            queryName = state.name;
+        }
+        this.services.api().lookupProfile(queryName, ApiKeyPool.Priority.LOW).whenComplete((profile, error) -> {
+            if (error != null) {
+                return;
+            }
+            synchronized (PikaStatsOverlayTracker.this) {
+                PlayerState current = this.players.get(playerKey(queryName));
+                if (current != state) {
+                    return;
+                }
+                current.level = profile.level();
+                current.rank = profile.primaryRank();
+                current.clanTag = profile.clanTag();
+            }
+            publishPlayerUpdate();
+        });
+    }
+
+    /** Players ranked by threat for the -threats command. */
+    synchronized LobbySnapshot lobbySnapshot(int limit) {
+        String own = this.ownName.get();
+        List<StatsFormatter.Threat> threats = this.players.values().stream()
+                .filter(player -> player.hasStats() && (own == null || !player.name.equalsIgnoreCase(own)))
+                .map(player -> new StatsFormatter.Threat(player.name, player.fkdr, player.wlr,
+                        Math.min(player.fkdr, 12.0) + Math.min(player.wlr, 8.0) * 0.8 + Math.min(player.kdr, 6.0) * 0.4,
+                        isPartyMember(player.name)))
+                .sorted(Comparator.comparingDouble(StatsFormatter.Threat::score).reversed())
+                .limit(limit)
+                .toList();
+        String scope = (this.period == StatsPeriod.ALL_TIME ? "" : this.period.displayName() + " ")
+                + this.mode.displayName();
+        return new LobbySnapshot(this.inBedWarsGame, threats, scope);
+    }
+
+    record LobbySnapshot(boolean active, List<StatsFormatter.Threat> threats, String scope) {
+    }
+
+    private boolean isPartyMember(String name) {
+        return this.services.partyStore().members().stream().anyMatch(member -> member.equalsIgnoreCase(name));
+    }
+
+    private static void resetPunishmentState(PlayerState player) {
+        player.punishmentRequestId++;
+        player.punishmentsLoaded = false;
+        player.punishmentsInFlight = false;
+        player.punishmentsCheckedAt = 0;
+        player.activePunishments = List.of();
+        player.punishmentsError = null;
+    }
+
+    private static long statsRetryDelayMillis(Throwable error, int attempt) {
+        PikaStatsApi.ErrorKind kind = PikaStatsApi.errorKind(error);
+        if (kind == PikaStatsApi.ErrorKind.RATE_LIMITED) {
+            return TimeUnit.MINUTES.toMillis(1);
+        }
+        if (kind == PikaStatsApi.ErrorKind.PLAYER_NOT_FOUND
+                || kind == PikaStatsApi.ErrorKind.AUTH_REQUIRED
+                || kind == PikaStatsApi.ErrorKind.BAD_REQUEST) {
+            return TimeUnit.MINUTES.toMillis(5);
+        }
+        int exponent = Math.min(Math.max(0, attempt - 1), 3);
+        return Math.min(TimeUnit.MINUTES.toMillis(5), TimeUnit.SECONDS.toMillis(30L << exponent));
+    }
+
     private void refreshPlayers() {
         List<PlayerState> requests = new ArrayList<>();
+        List<PlayerState> punishmentRequests = new ArrayList<>();
         String snapshot;
         synchronized (this) {
             if (!this.inBedWarsGame || this.closed) {
                 return;
             }
+            long now = System.currentTimeMillis();
             for (PlayerState player : this.players.values()) {
-                if (player.inFlight || player.status.equals("ready")) {
+                if (!player.punishmentsInFlight && (!player.punishmentsLoaded
+                        || now - player.punishmentsCheckedAt >= PUNISHMENT_REFRESH_INTERVAL_MILLIS)) {
+                    punishmentRequests.add(player);
+                }
+                if (player.inFlight || player.status.equals("ready") || now < player.nextStatsRetryAtMillis) {
                     continue;
                 }
                 if (player.status.equals("nicked") && player.retriesUsed >= MAX_RETRIES) {
@@ -700,13 +898,16 @@ final class PikaStatsOverlayTracker {
                 }
                 requests.add(player);
             }
-            if (requests.isEmpty()) {
+            if (requests.isEmpty() && punishmentRequests.isEmpty()) {
                 return;
             }
-            snapshot = buildMessage("game_update");
+            snapshot = requests.isEmpty() ? null : buildMessage("game_update");
         }
-        this.websocket.publish(snapshot, snapshot);
+        if (snapshot != null) {
+            this.websocket.publish(snapshot, snapshot);
+        }
         requests.forEach(this::requestPlayerStats);
+        punishmentRequests.forEach(this::requestPlayerPunishments);
     }
 
     private void handleScoreboardObjective(byte[] packetData, ProtocolVersion version) throws Exception {
@@ -792,7 +993,7 @@ final class PikaStatsOverlayTracker {
                     onScoreboardText(readComponent(input, version)); // Prefix
                     onScoreboardText(readComponent(input, version)); // Suffix
                 } else {
-                    onScoreboardText(PikaStatsChatParser.componentToPlainText(PacketTypes.readString(input, 256)));
+                    onScoreboardText(ChatIO.componentToPlainText(PacketTypes.readString(input, 256)));
                     String prefix = PacketTypes.readString(input, 256);
                     String suffix = PacketTypes.readString(input, 256);
                     onScoreboardText(prefix);
@@ -938,6 +1139,7 @@ final class PikaStatsOverlayTracker {
                 state.status = state.hasStats() ? "refreshing" : "loading";
                 state.retriesUsed = 0;
                 state.inFlight = false;
+                resetPunishmentState(state);
                 requests.add(state);
             }
         }
@@ -1006,16 +1208,47 @@ final class PikaStatsOverlayTracker {
                     JsonObject item = new JsonObject();
                     item.addProperty("name", player.name);
                     item.addProperty("status", player.status);
+                    String own = this.ownName.get();
+                    item.addProperty("self", own != null && own.equalsIgnoreCase(player.name));
+                    item.addProperty("party", isPartyMember(player.name));
+                    if (player.level > 0) {
+                        item.addProperty("level", player.level);
+                    }
+                    if (player.rank != null && !player.rank.isBlank()) {
+                        item.addProperty("rank", player.rank);
+                    }
+                    if (player.clanTag != null && !player.clanTag.isBlank()) {
+                        item.addProperty("clanTag", player.clanTag);
+                    }
                     item.addProperty("retryCount", player.retriesUsed);
                     if (player.fkdr != null && player.wlr != null && player.kdr != null) {
                         item.addProperty("fkdr", player.fkdr);
                         item.addProperty("wlr", player.wlr);
                         item.addProperty("kdr", player.kdr);
+                        item.addProperty("finalKills", player.finalKills);
+                        item.addProperty("wins", player.wins);
+                        item.addProperty("beds", player.beds);
+                        item.addProperty("games", player.games);
+                        item.addProperty("winstreak", player.winstreak);
+                        item.addProperty("noGames", player.noGames);
                         if (player.loadedMode != null && player.loadedPeriod != null) {
                             item.addProperty("loadedMode", player.loadedMode.name());
                             item.addProperty("loadedPeriod", player.loadedPeriod.apiValue());
                         }
                     }
+                    item.addProperty("punishmentsLoaded", player.punishmentsLoaded);
+                    if (player.punishmentsError != null) {
+                        item.addProperty("punishmentsError", player.punishmentsError);
+                    }
+                    JsonArray activePunishments = new JsonArray();
+                    for (PunishmentsResult.Entry entry : player.activePunishments) {
+                        JsonObject punishment = new JsonObject();
+                        punishment.addProperty("type", entry.type());
+                        punishment.addProperty("expires", entry.expires());
+                        punishment.addProperty("reason", entry.reason());
+                        activePunishments.add(punishment);
+                    }
+                    item.add("activePunishments", activePunishments);
                     playerArray.add(item);
                 });
         message.add("players", playerArray);
@@ -1025,10 +1258,10 @@ final class PikaStatsOverlayTracker {
     private static String readComponent(ByteBuf input, ProtocolVersion version) throws Exception {
         if (version.newerThanOrEqualTo(ProtocolVersion.v1_20_3)) {
             Tag tag = Types.TEXT_COMPONENT_TAG.read(input);
-            return PikaStatsChatParser.tagToPlainText(tag);
+            return ChatIO.tagToPlainText(tag);
         }
         String component = PacketTypes.readString(input, MAX_COMPONENT_LENGTH);
-        return PikaStatsChatParser.componentToPlainText(component);
+        return ChatIO.componentToPlainText(component);
     }
 
     private static void readOptionalComponent(ByteBuf input, ProtocolVersion version) throws Exception {
@@ -1087,14 +1320,6 @@ final class PikaStatsOverlayTracker {
         return name.toLowerCase(Locale.ROOT);
     }
 
-    private static double parseRatio(String value) {
-        try {
-            return Double.parseDouble(value);
-        } catch (RuntimeException ignored) {
-            return 0.0;
-        }
-    }
-
     private static String rootMessage(Throwable error) {
         Throwable current = error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
         while (current.getCause() != null && current.getCause() != current) {
@@ -1117,13 +1342,29 @@ final class PikaStatsOverlayTracker {
         private long generation;
         private String status = "loading";
         private int retriesUsed;
+        private long nextStatsRetryAtMillis;
         private boolean inFlight;
         private Double fkdr;
         private Double wlr;
         private Double kdr;
         private BedWarsMode loadedMode;
         private StatsPeriod loadedPeriod;
-
+        private boolean punishmentsLoaded;
+        private boolean punishmentsInFlight;
+        private long punishmentRequestId;
+        private long punishmentsCheckedAt;
+        private List<PunishmentsResult.Entry> activePunishments = List.of();
+        private String punishmentsError;
+        private long finalKills;
+        private long wins;
+        private long beds;
+        private long games;
+        private long winstreak;
+        private boolean noGames;
+        private boolean profileRequested;
+        private int level;
+        private String rank;
+        private String clanTag;
         private PlayerState(UUID id, String name, BedWarsMode requestedMode, StatsPeriod requestedPeriod, long generation) {
             this.id = id;
             this.name = name;

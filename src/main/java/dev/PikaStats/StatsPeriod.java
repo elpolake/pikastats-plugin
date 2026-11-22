@@ -3,19 +3,21 @@ package dev.PikaStats;
 import java.util.Locale;
 
 enum StatsPeriod {
-    ALL_TIME("a", "total", "All Time"),
-    WEEKLY("w", "weekly", "Weekly"),
-    MONTHLY("m", "monthly", "Monthly"),
-    YEARLY("y", "yearly", "Yearly");
+    ALL_TIME("a", "total", "All Time", "Lifetime"),
+    WEEKLY("w", "weekly", "Weekly", "Weekly"),
+    MONTHLY("m", "monthly", "Monthly", "Monthly"),
+    YEARLY("y", "yearly", "Yearly", "Yearly");
 
     private final String commandKey;
     private final String apiValue;
     private final String displayName;
+    private final String shortLabel;
 
-    StatsPeriod(String commandKey, String apiValue, String displayName) {
+    StatsPeriod(String commandKey, String apiValue, String displayName, String shortLabel) {
         this.commandKey = commandKey;
         this.apiValue = apiValue;
         this.displayName = displayName;
+        this.shortLabel = shortLabel;
     }
 
     String apiValue() {
@@ -26,17 +28,22 @@ enum StatsPeriod {
         return this.displayName;
     }
 
+    String shortLabel() {
+        return this.shortLabel;
+    }
+
+    /** Parses a chat token such as {@code w}, {@code weekly} or {@code lifetime}. */
     static StatsPeriod parse(String value) {
         if (value == null) {
             return null;
         }
-        String normalized = value.toLowerCase(Locale.ROOT);
-        for (StatsPeriod period : values()) {
-            if (period.commandKey.equals(normalized)) {
-                return period;
-            }
-        }
-        return null;
+        return switch (value.toLowerCase(Locale.ROOT)) {
+            case "a", "at", "all", "alltime", "all_time", "all-time", "total", "lifetime", "life", "lt" -> ALL_TIME;
+            case "w", "wk", "week", "weekly" -> WEEKLY;
+            case "m", "mo", "month", "monthly" -> MONTHLY;
+            case "y", "yr", "year", "yearly", "annual" -> YEARLY;
+            default -> null;
+        };
     }
 
     static StatsPeriod fromName(String value) {
@@ -52,6 +59,6 @@ enum StatsPeriod {
                 return period;
             }
         }
-        return null;
+        return parse(normalized);
     }
 }

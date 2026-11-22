@@ -1,48 +1,52 @@
 package dev.PikaStats;
 
+import com.viaversion.viaversion.libs.gson.JsonArray;
+import com.viaversion.viaversion.libs.gson.JsonElement;
+import com.viaversion.viaversion.libs.gson.JsonObject;
+import com.viaversion.viaversion.libs.gson.JsonParser;
 import net.raphimc.viaproxy.ViaProxy;
 import net.raphimc.viaproxy.plugins.ViaProxyPlugin;
 
-import java.net.http.HttpClient;
-import java.time.Duration;
-import com.viaversion.viaversion.libs.gson.JsonArray;
-import com.viaversion.viaversion.libs.gson.JsonObject;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public final class PikaStatsPlugin extends ViaProxyPlugin {
+    static final String VERSION = "2.3.1";
 
     private ExecutorService executor;
     private PikaStatsListener listener;
     private LocalWebSocketServer websocket;
+    private Services services;
 
     @Override
     public void onEnable() {
-        this.executor = Executors.newFixedThreadPool(2, new DaemonThreadFactory());
-        HttpClient httpClient = HttpClient.newBuilder()
-                .connectTimeout(Duration.ofSeconds(5))
-                .executor(this.executor)
-                .followRedirects(HttpClient.Redirect.NORMAL)
-                .build();
+        AtomicInteger threadNumber = new AtomicInteger();
+        this.executor = Executors.newFixedThreadPool(4, task -> {
+            Thread thread = new Thread(task, "PikaStats-HTTP-" + threadNumber.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
+        });
 
-        OverlaySettings settings = OverlaySettings.load(getDataFolder());
-        PikaStatsApi api = new PikaStatsApi(
-                httpClient, this.executor, new PikaStatsCache(Duration.ofSeconds(45)), settings.apiKey());
-        if (settings.apiKey().isBlank()) {
-            System.err.println("[PikaStats] PikaNetwork now requires an API key. Run /apikey in game and set api-key in plugins/PikaStats/overlay.properties.");
-        }
-        this.websocket = new LocalWebSocketServer(settings.websocketPort(), initialOverlayMessage());
+        PluginConfig config = PluginConfig.load(getDataFolder());
+        PartyStore partyStore = new PartyStore(getDataFolder());
+        this.websocket = new LocalWebSocketServer(config.websocketPort(), initialOverlayMessage(),
+                PartyStore.apiMessage(partyStore.members()));
         try {
             this.websocket.start();
-            System.out.println("[PikaStats] Local overlay WebSocket listening on 127.0.0.1:" + settings.websocketPort());
+            System.out.println("[PikaStats] Overlay WebSocket listening on 127.0.0.1:" + config.websocketPort());
         } catch (Exception error) {
             System.err.println("[PikaStats] Could not start the overlay WebSocket: " + error.getMessage());
         }
-        this.listener = new PikaStatsListener(api, this.websocket, settings.fallbackMode());
+        this.services = new Services(getDataFolder(), this.executor, config, partyStore, this.websocket);
+        this.listener = new PikaStatsListener(this.services);
         ViaProxy.EVENT_MANAGER.register(this.listener);
-        System.out.println("[PikaStats] Enabled for ViaProxy 3.4.14");
+        KeysTab.installWhenReady(this.services);
+        String build = "";
+        System.out.println("[PikaStats] " + VERSION + build + " enabled. Style: " + config.chatTheme().id()
+                + ", type -help in game.");
     }
 
     @Override
@@ -59,8 +63,13 @@ public final class PikaStatsPlugin extends ViaProxyPlugin {
             this.executor.shutdownNow();
             this.executor = null;
         }
+        if (this.services != null) {
+            this.services.close();
+            this.services = null;
+        }
         System.out.println("[PikaStats] Disabled");
     }
+
 
     private static String initialOverlayMessage() {
         JsonObject message = new JsonObject();
@@ -70,16 +79,5 @@ public final class PikaStatsPlugin extends ViaProxyPlugin {
         message.addProperty("period", StatsPeriod.ALL_TIME.apiValue());
         message.add("players", new JsonArray());
         return message.toString();
-    }
-
-    private static final class DaemonThreadFactory implements ThreadFactory {
-        private final AtomicInteger nextThread = new AtomicInteger();
-
-        @Override
-        public Thread newThread(Runnable task) {
-            Thread thread = new Thread(task, "PikaStats-HTTP-" + this.nextThread.incrementAndGet());
-            thread.setDaemon(true);
-            return thread;
-        }
     }
 }

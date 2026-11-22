@@ -1,122 +1,127 @@
-# PikaStats ViaProxy Plugin
+# PikaStats 2.3 — ViaProxy plugin
 
-PikaStats adds PikaNetwork BedWars stats and punishment lookups to ViaProxy. It can also send the live BedWars roster and detailed player data to the optional [PikaStats Desktop Overlay](https://github.com/elpolake/pikastats-overlay).
+PikaNetwork BedWars/SkyWars stats, profiles and punishments right in chat, with colored replies in the
+server's `&#rrggbb` format that always fit the 128-character chat limit. Also feeds the
+[desktop overlay](https://github.com/elpolake/pikastats-overlay).
 
-## What it does
+## Download
 
-- Looks up BedWars stats by player, including wins, losses, kills, deaths, final kills, final deaths, FKDR, WLR, and KDR.
-- Supports all-time, weekly, monthly, and yearly stats across all modes, solo, doubles, triples, or quads.
-- Looks up ban, mute, warning, and kick counts plus recent punishment dates and reasons.
-- Provides a local WebSocket feed for the desktop overlay. The feed listens on 127.0.0.1 by default.
+Easiest: download `PikaStats-Setup-<version>.zip` from [Releases](https://github.com/elpolake/pikastats-plugin/releases),
+unzip it and double-click `Install PikaStats.bat`. It sets up ViaProxy, this plugin and the desktop overlay
+(no admin rights needed). Or put `PikaStats-<version>.jar` into ViaProxy's `plugins` folder yourself.
+
+Build from source: `gradlew build` makes `build/libs/PikaStats-<version>.jar`. It needs
+`ViaProxy-3.4.14.jar` next to this folder, in `libs/`, or set with `-PviaproxyJar=<path>`.
+The installer's source is in [`installer/`](installer).
 
 ## Install
 
-1. Download **PikaStats-1.0.0.jar** from the [v1.0.0 release](https://github.com/elpolake/pikastats-plugin/releases/tag/v1.0.0).
-2. Put the JAR in ViaProxy's plugins folder.
-3. Start or restart ViaProxy once so it creates **plugins/PikaStats/overlay.properties**.
-4. In PikaNetwork, get your API key with **/apikey**.
-5. Set the **api-key** property in **plugins/PikaStats/overlay.properties**. The key stays on your computer; do not post it in chat, commit it, or share it.
-6. Restart ViaProxy to load the key.
+1. Download `PikaStats-<version>.jar` from Releases (or build it) and put it in ViaProxy's `plugins` folder.
+2. Start ViaProxy once. It creates `plugins/PikaStats/config.properties`
+   (settings from the old `overlay.properties`, including your API key, are migrated automatically).
+3. Get a key in game with `/apikey` and set `api-key=` (or the `PIKA_STATS_API_KEY` environment variable).
+4. Type `-ps reload` in game (or restart ViaProxy).
 
-The plugin creates **overlay.properties** with a blank key and these defaults:
+## API keys & rate limits
 
-~~~properties
-api-key=
-websocket-port=8765
-fallback-mode=QUADS
-~~~
+PikaNetwork allows about **120 API requests per minute per key**. PikaStats:
 
-You can set the environment variable **PIKA_STATS_API_KEY** before starting ViaProxy instead. It takes precedence over the key in the properties file.
+- spreads requests over **any number of keys**, always using the one with the most quota left (read from the
+  API's rate-limit headers), and never sends a request a key has no quota for, so you don't get 429s;
+- queues requests by priority: commands you type first, overlay clicks next, background lobby loading last —
+  and background loading leaves part of every key's quota free so your own `-stats` is answered instantly;
+- caches results (lifetime stats 10 min, weekly 3 min, profiles 30 min) and, if the API is rate limiting or down,
+  answers with the last known result instead of an error;
+- sets aside keys that the API rejects, and cools down a key that gets rate limited anyway.
 
-The other properties are:
-
-- **websocket-port** selects the local port for the overlay feed. It defaults to **8765** and must be in the range 1024 to 65535.
-- **fallback-mode** selects the BedWars mode used by the overlay if ViaProxy cannot identify the current mode. Set it to **SOLO**, **DOUBLES**, **TRIPLES**, or **QUADS**; the default is **QUADS**.
+Manage keys in **ViaProxy's window → PikaStats tab** (add, remove, test, live quota per key), or put them
+comma-separated in `api-keys=` in `config.properties`. `-ps keys` shows the same status in game.
 
 ## Commands
 
-Commands are typed in Minecraft chat. Results are sent to public chat, so do not include your API key in a command.
+**Your own lookups only show to you**: the command is not sent and the answer appears only in your chat.
 
-### BedWars stats
+- End a lookup with `global` (or `g`) to send the command and the answer to **the chat you are in right now**,
+  party or global, exactly as if you had typed them. PikaStats reads the server's echo of your command to know
+  where it landed, and uses colors only if that was party chat.
+- End it with `party` to send both to party chat. Only you can use these keywords.
 
-~~~text
--stats <player> [period mode] [stat]
-~~~
+**Other players' lookups** (`-stats`, `-sw`, `-profile`, `-compare`, `-punishments`):
 
-The player name must contain 1 to 16 letters, numbers, or underscores. If you omit the period and mode, the plugin uses all-time and all modes. To choose a period, provide both a period and a mode.
+- `-partycommands on|off` (default on): party members' commands are answered in party chat, with colors.
+- `-global on|off` (default off): commands typed in global chat are answered in global chat, without colors
+  (PikaNetwork shows color codes as text there). `!` is added only while your plain messages go to party chat.
 
-Periods:
+**Long answers are split** into several messages instead of being cut, at least 500 ms apart.
+PikaNetwork limits a 1.8 client to 100 characters per message and blocks every non-ASCII character, so
+PikaStats only sends ASCII there.
 
-- **a** - all time
-- **w** - weekly
-- **m** - monthly
-- **y** - yearly
+| Command | What it does |
+|---|---|
+| `-stats <player> [mode] [period] [view] [q]` | BedWars stats (aliases `-s`, `-bw`). Arguments in any order. |
+| `-sw <player> [solo\|doubles] [period]` | SkyWars stats |
+| `-compare <p1> <p2> [mode] [period] [sw]` | Head to head, winner of each stat in green (`-vs`) |
+| `-profile <player>` | Network level, rank, clan, last seen, friends (`-level`) |
+| `-punishments <player> [count\|reason]` | Ban/mute/warn/kick history (`-bans`) |
+| `-threats [global\|party]` | Strongest players in your current BedWars lobby |
+| `-partycommands on\|off` | Let party members use lookups (answers in party chat) |
+| `-global on\|off` | Let everyone use lookups (answers in global chat with `!`) |
+| `-allow party\|global <cmds>` | Which lookups others may use there: `stats sw compare profile punishments`, `all` or `none`. Also editable in the overlay (⚙) |
+| `-style [name]` / `-styles` | Pick a chat color style, with previews |
+| `-grad [#from] [#to] [#more] <text>` | Send gradient text, auto-fitted to 128 chars. `-rainbow`, `-fade`, `-pgrad` (party) |
+| `-party list\|add\|remove\|clear` | Saved party list (PARTY badges in the overlay) |
+| `-ps status\|keys\|reload\|colors <hex\|legacy\|none>\|clear` | Settings |
+| `-help` | Everything above, in game |
 
-Modes:
+**Modes:** `solo`/`1`/`1s`, `doubles`/`duos`/`2`, `triples`/`trios`/`3`, `quads`/`4` (default: overall)
+**Periods:** `w`/`weekly`, `m`/`monthly`, `y`/`yearly`, `a`/`lifetime` (default: lifetime). The old `-stats Steve w 4` syntax still works.
+**Views:** `full` (3 lines), `lb` (leaderboard places), `combat`, `fkdr`, `wlr`, `kdr`, `bblr`, `wins`, `losses`,
+`finals`, `fd`, `kills`, `deaths`, `games`, `beds`, `ws`, `wr` (win rate), `fpg` (finals per game), `acc`.
 
-- **a** - all modes
-- **1** - solo
-- **2** - doubles
-- **3** - triples
-- **4** - quads
+Examples: `-stats isabe5lgod4117` (only you see it), `-stats isabe5lgod4117 quads weekly full global`, `-vs Steve Alex 4 party`.
 
-If you omit the stat selector, the plugin returns a summary. Selectors are **wins** or **win**, **losses** or **loss**, **final_kills** or **final_kill**, **final_deaths** or **final_death**, **kills** or **kill**, **deaths** or **death**, **fkdr**, **wlr**, and **kdr**. Final-kill aliases **final**, **finals**, **finalkill**, and **finalkills** are also accepted; final-death aliases **finaldeath** and **finaldeaths** are accepted. Hyphens can replace underscores.
 
-Examples:
+## Chat styles
 
-~~~text
--stats Steve
--stats Steve w 4
--stats Steve fkdr
--stats Steve m 2 wins
-~~~
+`midnight` (default, dark modern violet), `obsidian`, `eclipse` (white→black fade), `void`, `neon`, `tokyo`,
+`dracula`, `crimson`, `ocean`, `aurora`, `emerald`, `toxic`, `sunset`, `gold`, `frost`, `sakura`, `classic`, `plain`.
+Ratios are colored by tier (low → insane). Example (midnight, 127/128 chars):
 
-### Punishments
+```
+&#a78bfa* &#f5f3ffIsabe5lGod4117&#8a87a8 | BW Overall | FKDR &#fb923c4.57&#8a87a8 | WLR &#facc151.46&#8a87a8 | KDR &#e5e7eb1.44
+```
 
-~~~text
--punishments <player> [count|reason]
-~~~
+When a line would be too long the plugin merges similar colors, then drops the least important stats, and only
+truncates as a last resort. Fancy symbols (✦ ┃ ⚡ …) are only used once the server is known to allow them (list them in
+`extra-allowed-chars`, then `-ps reload`); until then ASCII fallbacks (`*`, `|`) are used. Characters a vanilla server
+kicks for (control characters, `§`) are never sent.
 
-- **-punishments <player>** shows counts and up to three recent punishment types and dates.
-- Add **count** to show only counts in this format: **bans: N | mutes: N | warns: N | kicks: N**.
-- Add **reason** to send the counts, then each available punishment in its own public chat message. Each entry includes the punishment type, date in **yy-mm-dd** format, and reason. Messages are spaced 250 ms apart.
+## Settings (`config.properties`)
 
-Reason text is shortened to fit the chat limit, filtered text is redacted, and URLs are obfuscated because PikaNetwork chat may reject some words or links. The server can still reject a reason. Use this option knowing the output is public.
+| Key | Default | |
+|---|---|---|
+| `api-key` | | PikaNetwork API key |
+| `api-keys` | | More keys, comma separated (the GUI tab writes this) |
+| `chat-style` | `midnight` | Chat color style |
+| `color-mode` | `hex` | Party chat colors: `hex`, `legacy` (`&a`, 2 chars per color) or `none`. With `hex`, a message switches to `legacy` codes when that saves a message |
+| `public-color-mode` | `none` | Colors in public/global chat (PikaNetwork shows them as text) |
+| `chat-max-length` | `128` | Server chat limit including `/p c ` and color codes |
+| `chat-delay-ms` | `500` | Pause between messages the plugin sends |
+| `party-commands` | `true` | Answer party members' lookups in party chat |
+| `global-commands` | `false` | Answer everyone's lookups in global chat (`!`) |
+| `others-cooldown-seconds` | `4` | Cooldown for the same command from others |
+| `extra-allowed-chars` | | Extra characters to treat as allowed |
+| `websocket-port` | `8765` | Local port for the desktop overlay |
+| `fallback-mode` | `QUADS` | Overlay mode when it cannot be detected |
+| `overlay-profiles` | `true` | Load level/rank for overlay players |
 
-Examples:
+## Build & test
 
-~~~text
--punishments Steve
--punishments Steve count
--punishments Steve reason
-~~~
+Needs Java 17+. The build uses `../ViaProxy-3.4.14.jar` (or `libs/…`, `-PviaproxyJar=…`, `VIAPROXY_JAR`).
 
-## Desktop overlay
+```powershell
+.\gradlew.bat assemble test
+```
 
-Install and run the [PikaStats Desktop Overlay](https://github.com/elpolake/pikastats-overlay) separately. The plugin provides the live BedWars roster and player details over a local WebSocket. Its default port is **8765**; set **websocket-port** in **overlay.properties** to match the overlay's **config.json** if you change it.
-
-## Build from source
-
-You need Java 17 and a ViaProxy JAR matching the version you run. The build uses the ViaProxy JAR to compile and does not bundle it. Put it at **libs/ViaProxy-3.4.14.jar**, set **VIAPROXY_JAR**, or pass a path with **-PviaproxyJar**.
-
-PowerShell:
-
-~~~powershell
-.\gradlew.bat jar
-~~~
-
-Linux or macOS:
-
-~~~sh
-./gradlew jar
-~~~
-
-The output is **build/libs/PikaStats-1.0.0.jar**.
-
-## Troubleshooting
-
-- **The API says a key is required:** check the key in **plugins/PikaStats/overlay.properties** or **PIKA_STATS_API_KEY**, then restart ViaProxy.
-- **The overlay is disconnected:** make sure the plugin started, then check the WebSocket port in both plugin and overlay settings.
-- **A player has no stats:** the player may be nicked, have stats hidden, or not have an available profile.
-- **Requests are rate limited:** wait before retrying. Repeated stats requests are cached briefly.
-- **A punishment reason is rejected:** the plugin filters some text and hides URLs, but PikaNetwork may still reject server-provided text.
+With `PIKA_STATS_API_KEY` set, `.\gradlew.bat test -PshowOutput` also runs a live test that renders real stats
+(default player `isabe5lgod4117`, override with `PIKA_STATS_TEST_PLAYER`) in every style.

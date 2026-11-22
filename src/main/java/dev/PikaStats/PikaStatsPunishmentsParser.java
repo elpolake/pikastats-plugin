@@ -38,14 +38,15 @@ final class PikaStatsPunishmentsParser {
 
         String tbody = divContents(html, "tbody");
         return new PunishmentsResult(
+                username,
                 readFilterCount(html, "Bans"),
                 readFilterCount(html, "Kicks"),
                 readFilterCount(html, "Mutes"),
                 readFilterCount(html, "Warnings"),
-                readRecent(tbody));
+                readEntries(tbody));
     }
 
-    private static List<PunishmentsResult.Entry> readRecent(String tbody) {
+    private static List<PunishmentsResult.Entry> readEntries(String tbody) {
         if (tbody == null || tbody.isBlank()) {
             return List.of();
         }
@@ -64,13 +65,16 @@ final class PikaStatsPunishmentsParser {
             String type = compactType(field(row, "_type"));
             String date = field(row, "_date");
             String reason = field(row, "_reason");
+            String expires = field(row, "_expires");
             if (type.isBlank()) {
                 continue;
             }
             recent.add(new PunishmentsResult.Entry(
                     type,
                     compactDate(date),
-                    reason));
+                    reason,
+                    expires,
+                    isActive(type, expires)));
         }
         return recent;
     }
@@ -90,6 +94,30 @@ final class PikaStatsPunishmentsParser {
             return "W";
         }
         return "";
+    }
+
+    private static boolean isActive(String type, String expires) {
+        if (!("B".equals(type) || "M".equals(type) || "W".equals(type)) || expires.isBlank()) {
+            return false;
+        }
+        String normalizedExpiry = expires.toLowerCase(Locale.ROOT);
+        if (normalizedExpiry.contains("expired")
+                || normalizedExpiry.contains("unbanned")
+                || normalizedExpiry.contains("unmuted")
+                || normalizedExpiry.contains("unwarned")) {
+            return false;
+        }
+        if (normalizedExpiry.contains("permanent")) {
+            return true;
+        }
+        int statusStart = expires.indexOf(" (");
+        String expiryDate = (statusStart < 0 ? expires : expires.substring(0, statusStart)).trim();
+        try {
+            LocalDateTime expiresAt = LocalDateTime.parse(expiryDate, PAGE_DATE);
+            return expiresAt.isAfter(LocalDateTime.now());
+        } catch (DateTimeParseException ignored) {
+            return false;
+        }
     }
 
     private static String field(String row, String suffix) {

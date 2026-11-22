@@ -3,7 +3,7 @@ plugins {
 }
 
 group = 'dev.PikaStats'
-version = '1.0.0'
+version = '2.3.1'
 
 java {
     sourceCompatibility = JavaVersion.VERSION_17
@@ -16,11 +16,15 @@ repositories {
 
 def viaProxyJar = providers.gradleProperty('viaproxyJar')
     .orElse(providers.environmentVariable('VIAPROXY_JAR'))
-    .orElse('libs/ViaProxy-3.4.14.jar')
+    .orElse(file('libs/ViaProxy-3.4.14.jar').exists() ? 'libs/ViaProxy-3.4.14.jar' : '../ViaProxy-3.4.14.jar')
 
 dependencies {
     // ViaProxy provides these classes at runtime, so they must not be bundled.
     compileOnly files(viaProxyJar.get())
+    testImplementation files(viaProxyJar.get())
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
 }
 
 tasks.withType(JavaCompile).configureEach {
@@ -28,6 +32,35 @@ tasks.withType(JavaCompile).configureEach {
     options.release = 17
 }
 
-tasks.named('jar') {
+tasks.named('test') {
+    useJUnitPlatform()
+    testLogging {
+        events 'failed'
+        showStandardStreams = providers.gradleProperty('showOutput').isPresent()
+        exceptionFormat = 'full'
+    }
+    // The live API test only runs when PIKA_STATS_API_KEY is set.
+    environment 'PIKA_STATS_API_KEY', System.getenv('PIKA_STATS_API_KEY') ?: ''
+}
+
+// viaproxy.yml with the version from this file.
+def pluginYmlDir = layout.buildDirectory.dir('plugin-yml')
+def pluginYml = tasks.register('pluginYml') {
+    inputs.property('version', project.version.toString())
+    outputs.dir(pluginYmlDir)
+    doLast {
+        def dir = pluginYmlDir.get().asFile
+        dir.mkdirs()
+        new File(dir, 'viaproxy.yml').text = """name: "PikaStats"
+version: "${project.version}"
+author: "PikaStats"
+main: "dev.PikaStats.PikaStatsPlugin"
+min-version: "3.4.13"
+"""
+    }
+}
+tasks.named('jar', Jar) {
     archiveBaseName = 'PikaStats'
+    dependsOn pluginYml
+    from(pluginYmlDir)
 }

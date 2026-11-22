@@ -1,83 +1,141 @@
 package dev.PikaStats;
 
 import java.time.Duration;
-import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
-final class PikaStatsCache {
-    private final long ttlNanos;
-    private final ConcurrentMap<String, CacheEntry<String>> canonicalNames = new ConcurrentHashMap<>();
-    private final ConcurrentMap<StatsKey, CacheEntry<StatsResult>> stats = new ConcurrentHashMap<>();
+/**
+ * Async cache. Concurrent requests for the same key share one HTTP call, finished values live for
+ * their TTL, and when a refresh fails (rate limit, network) the last good value is served instead
+ * of an error for up to {@link #STALE_LIMIT}.
+ */
+final class PikaStatsCache<K, V> {
+    private static final int MAX_ENTRIES = 3_000;
+    private static final long STALE_LIMIT = Duration.ofHours(2).toNanos();
+
+    private final long defaultTtlNanos;
+    private final ConcurrentMap<K, Entry<V>> entries = new ConcurrentHashMap<>();
+    private final AtomicLong hits = new AtomicLong();
+    private final AtomicLong misses = new AtomicLong();
+    private final AtomicLong staleServed = new AtomicLong();
 
     PikaStatsCache(Duration ttl) {
-        this.ttlNanos = ttl.toNanos();
+        this.defaultTtlNanos = ttl.toNanos();
     }
 
-    CompletableFuture<String> canonicalName(String requestedName, Supplier<CompletableFuture<String>> loader) {
-        String key = requestedName.toLowerCase(Locale.ROOT);
-        return getOrLoad(this.canonicalNames, key, loader);
+    CompletableFuture<V> get(K key, Supplier<CompletableFuture<V>> loader) {
+        return get(key, this.defaultTtlNanos, loader);
     }
 
-    CompletableFuture<StatsResult> stats(String canonicalName, StatsPeriod period, BedWarsMode mode,
-                                         Supplier<CompletableFuture<StatsResult>> loader) {
-        StatsKey key = new StatsKey(canonicalName, period, mode);
-        return getOrLoad(this.stats, key, loader);
+    CompletableFuture<V> get(K key, Duration ttl, Supplier<CompletableFuture<V>> loader) {
+        return get(key, ttl.toNanos(), loader);
     }
 
-    CompletableFuture<StatsResult> refreshStats(String canonicalName, StatsPeriod period, BedWarsMode mode,
-                                                 Supplier<CompletableFuture<StatsResult>> loader) {
-        StatsKey key = new StatsKey(canonicalName, period, mode);
-        CacheEntry<StatsResult> entry = this.stats.compute(key, (ignored, existing) -> {
+    private CompletableFuture<V> get(K key, long ttlNanos, Supplier<CompletableFuture<V>> loader) {
+        prune();
+        boolean[] hit = {true};
+        Entry<V> entry = this.entries.compute(key, (ignored, existing) -> {
+            if (existing != null && (!existing.future.isDone() || existing.expiresAtNanos > System.nanoTime())) {
+                return existing;
+            }
+            hit[0] = false;
+            return load(key, ttlNanos, loader, existing);
+        });
+        (hit[0] ? this.hits : this.misses).incrementAndGet();
+        return entry.future;
+    }
+
+    /** Ignores a finished cached value, but still joins a request already in flight. */
+    CompletableFuture<V> refresh(K key, Duration ttl, Supplier<CompletableFuture<V>> loader) {
+        Entry<V> entry = this.entries.compute(key, (ignored, existing) -> {
             if (existing != null && !existing.future.isDone()) {
                 return existing;
             }
-
-            CompletableFuture<StatsResult> future;
-            try {
-                future = loader.get();
-            } catch (Throwable error) {
-                future = CompletableFuture.failedFuture(error);
-            }
-            return new CacheEntry<>(future, System.nanoTime() + this.ttlNanos);
+            return load(key, ttl.toNanos(), loader, existing);
         });
-        entry.future.whenComplete((value, error) -> {
-            if (error != null) {
-                this.stats.remove(key, entry);
-            }
-        });
+        this.misses.incrementAndGet();
         return entry.future;
     }
 
-    private <K, V> CompletableFuture<V> getOrLoad(ConcurrentMap<K, CacheEntry<V>> cache, K key,
-                                                   Supplier<CompletableFuture<V>> loader) {
-        CacheEntry<V> entry = cache.compute(key, (ignored, existing) -> {
-            long now = System.nanoTime();
-            if (existing != null && existing.expiresAtNanos > now) {
-                return existing;
-            }
+    void clear() {
+        this.entries.clear();
+    }
 
-            CompletableFuture<V> future;
-            try {
-                future = loader.get();
-            } catch (Throwable error) {
-                future = CompletableFuture.failedFuture(error);
+    long hits() {
+        return this.hits.get();
+    }
+
+    long misses() {
+        return this.misses.get();
+    }
+
+    long staleServed() {
+        return this.staleServed.get();
+    }
+
+    private Entry<V> load(K key, long ttlNanos, Supplier<CompletableFuture<V>> loader, Entry<V> previous) {
+        V stale = previous == null ? null : previous.lastValue;
+        long staleAt = previous == null ? 0 : previous.lastValueAt;
+        CompletableFuture<V> loaded;
+        try {
+            loaded = loader.get();
+        } catch (Throwable error) {
+            loaded = CompletableFuture.failedFuture(error);
+        }
+        CompletableFuture<V> withFallback = loaded.handle((value, error) -> {
+            if (error == null) {
+                return CompletableFuture.completedFuture(value);
             }
-            return new CacheEntry<>(future, now + this.ttlNanos);
-        });
-        entry.future.whenComplete((value, error) -> {
+            boolean usable = stale != null && System.nanoTime() - staleAt < STALE_LIMIT
+                    && PikaStatsApi.errorKind(error) != PikaStatsApi.ErrorKind.PLAYER_NOT_FOUND;
+            if (usable) {
+                this.staleServed.incrementAndGet();
+                return CompletableFuture.completedFuture(stale);
+            }
+            return CompletableFuture.<V>failedFuture(error);
+        }).thenCompose(future -> future);
+        Entry<V> entry = new Entry<>(withFallback, stale, staleAt);
+        loaded.whenComplete((value, error) -> {
             if (error != null) {
-                cache.remove(key, entry);
+                if (stale != null) {
+                    // Retry soon, but keep serving the old value until then.
+                    entry.expiresAtNanos = System.nanoTime() + Duration.ofSeconds(20).toNanos();
+                } else {
+                    // Expire immediately (this can run before the entry is even stored) and drop it.
+                    entry.expiresAtNanos = 0;
+                    this.entries.remove(key, entry);
+                }
+            } else {
+                entry.lastValue = value;
+                entry.lastValueAt = System.nanoTime();
+                entry.expiresAtNanos = System.nanoTime() + ttlNanos;
             }
         });
-        return entry.future;
+        return entry;
     }
 
-    private record CacheEntry<V>(CompletableFuture<V> future, long expiresAtNanos) {
+    private void prune() {
+        if (this.entries.size() < MAX_ENTRIES) {
+            return;
+        }
+        long now = System.nanoTime();
+        this.entries.entrySet().removeIf(item -> item.getValue().future.isDone()
+                && now - item.getValue().lastValueAt > STALE_LIMIT);
     }
 
-    private record StatsKey(String canonicalName, StatsPeriod period, BedWarsMode mode) {
+    private static final class Entry<V> {
+        private final CompletableFuture<V> future;
+        private volatile long expiresAtNanos = Long.MAX_VALUE;
+        private volatile V lastValue;
+        private volatile long lastValueAt;
+
+        private Entry(CompletableFuture<V> future, V lastValue, long lastValueAt) {
+            this.future = future;
+            this.lastValue = lastValue;
+            this.lastValueAt = lastValueAt;
+        }
     }
 }

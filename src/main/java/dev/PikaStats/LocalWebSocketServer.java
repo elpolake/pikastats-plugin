@@ -18,7 +18,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.Consumer;
 
-/** Minimal local-only RFC 6455 server; it only sends JSON text frames to the overlay. */
+/** Minimal local-only RFC 6455 server for the desktop overlay and other local tools (JSON text frames). */
 final class LocalWebSocketServer implements AutoCloseable {
     private static final String WEBSOCKET_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
     private static final int MAX_HTTP_HEADER_BYTES = 8_192;
@@ -37,14 +37,16 @@ final class LocalWebSocketServer implements AutoCloseable {
     });
     private final Set<WebSocketClient> clients = ConcurrentHashMap.newKeySet();
     private volatile String latestSnapshot;
-    private volatile Consumer<String> messageHandler = ignored -> { };
+    private volatile String latestPartySnapshot;
+    private final Set<Consumer<String>> messageHandlers = new java.util.concurrent.CopyOnWriteArraySet<>();
     private volatile boolean running;
     private ServerSocket serverSocket;
     private Thread acceptThread;
 
-    LocalWebSocketServer(int port, String initialSnapshot) {
+    LocalWebSocketServer(int port, String initialSnapshot, String initialPartySnapshot) {
         this.port = port;
         this.latestSnapshot = initialSnapshot;
+        this.latestPartySnapshot = initialPartySnapshot;
     }
 
     void start() throws IOException {
@@ -65,6 +67,15 @@ final class LocalWebSocketServer implements AutoCloseable {
         if (snapshot != null) {
             this.latestSnapshot = snapshot;
         }
+        broadcast(event);
+    }
+
+    synchronized void publishParty(String snapshot) {
+        this.latestPartySnapshot = snapshot;
+        broadcast(snapshot);
+    }
+
+    private void broadcast(String event) {
         try {
             this.broadcastExecutor.execute(() -> {
                 for (WebSocketClient client : this.clients) {
@@ -79,12 +90,25 @@ final class LocalWebSocketServer implements AutoCloseable {
         }
     }
 
-    void setMessageHandler(Consumer<String> handler) {
-        this.messageHandler = handler == null ? ignored -> { } : handler;
+    void addMessageHandler(Consumer<String> handler) {
+        if (handler != null) {
+            this.messageHandlers.add(handler);
+        }
+    }
+
+    void removeMessageHandler(Consumer<String> handler) {
+        this.messageHandlers.remove(handler);
+    }
+
+    int clientCount() {
+        return this.clients.size();
     }
 
     private synchronized void registerClient(WebSocketClient client) {
         client.send(this.latestSnapshot);
+        if (this.latestPartySnapshot != null) {
+            client.send(this.latestPartySnapshot);
+        }
         this.clients.add(client);
     }
 
@@ -180,10 +204,13 @@ final class LocalWebSocketServer implements AutoCloseable {
             } else if (opcode == 0x9) {
                 client.sendFrame(0xA, payload);
             } else if (opcode == 0x1) {
-                try {
-                    this.messageHandler.accept(new String(payload, StandardCharsets.UTF_8));
-                } catch (RuntimeException ignored) {
-                    // Malformed local control messages cannot affect ViaProxy or other clients.
+                String message = new String(payload, StandardCharsets.UTF_8);
+                for (Consumer<String> handler : this.messageHandlers) {
+                    try {
+                        handler.accept(message);
+                    } catch (RuntimeException ignored) {
+                        // Malformed local control messages cannot affect ViaProxy or other clients.
+                    }
                 }
             }
         }

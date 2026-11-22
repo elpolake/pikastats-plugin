@@ -1,81 +1,52 @@
 package dev.PikaStats;
 
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.regex.Pattern;
 
-record PunishmentsResult(
-        int bans,
-        int kicks,
-        int mutes,
-        int warnings,
-        List<Entry> entries) {
-    private static final int MAX_CHAT_LENGTH = 100;
-    private static final int MAX_RECENT = 3;
-    private static final Pattern URL = Pattern.compile(
-            "(?i)\\b(https?)://([a-z0-9-]+)\\.([a-z]{2,})(/[^\\s]*)?");
+record PunishmentsResult(String username, int bans, int kicks, int mutes, int warnings, List<Entry> entries) {
+    private static final Pattern URL = Pattern.compile("(?i)\\b(https?)://([a-z0-9-]+)\\.([a-z]{2,})(/\\S*)?");
+    private static final Pattern DOMAIN = Pattern.compile("(?i)\\b([a-z0-9-]{2,}\\.)+(com|net|org|gg|io|xyz|me|cc|tk|ru|sc|be|pics|co|de|uk|us)\\b(/\\S*)?");
 
     PunishmentsResult {
         entries = List.copyOf(entries);
     }
 
-    String countsMessage() {
-        return "bans: " + bans + " | mutes: " + mutes + " | warns: " + warnings + " | kicks: " + kicks;
+    static PunishmentsResult combine(PunishmentsResult all, PunishmentsResult... filtered) {
+        LinkedHashSet<Entry> unique = new LinkedHashSet<>(all.entries());
+        for (PunishmentsResult result : filtered) {
+            unique.addAll(result.entries());
+        }
+        return new PunishmentsResult(all.username(), all.bans(), all.kicks(), all.mutes(), all.warnings(), new ArrayList<>(unique));
     }
 
-    String compactMessage() {
-        StringBuilder message = new StringBuilder(countsMessage());
-        int appended = 0;
-        for (Entry entry : entries) {
-            if (appended >= MAX_RECENT) {
-                break;
-            }
-            String item = entry.compactText();
-            if (message.length() + 3 + item.length() > MAX_CHAT_LENGTH) {
-                break;
-            }
-            message.append(" | ").append(item);
-            appended++;
-        }
-        return message.toString();
+    List<Entry> activePunishments() {
+        return this.entries.stream().filter(Entry::active).toList();
     }
 
-    List<String> reasonMessages() {
-        List<String> messages = new java.util.ArrayList<>();
-        messages.add(countsMessage());
-        for (Entry entry : entries) {
-            String typeName = switch (entry.type()) {
-                case "B" -> "ban";
-                case "K" -> "kick";
-                case "M" -> "mute";
-                case "W" -> "warn";
-                default -> entry.type();
-            };
-            String prefix = entry.date().isBlank()
-                    ? typeName
-                    : typeName + " " + entry.date();
-            String reason = entry.reason().isBlank() ? "No reason listed" : redactFilteredWords(entry.reason());
-            String reasonPrefix = prefix + ": ";
-            int room = Math.max(0, MAX_CHAT_LENGTH - reasonPrefix.length());
-            if (reason.length() > room) {
-                reason = reason.substring(0, room).stripTrailing();
-            }
-            messages.add(reasonPrefix + reason);
-        }
-        if (messages.size() == 1) {
-            messages.add("No punishments found.");
-        }
-        return List.copyOf(messages);
+    int total() {
+        return this.bans + this.kicks + this.mutes + this.warnings;
     }
 
-    private static String redactFilteredWords(String reason) {
-        String safeReason = reason
-                .replaceAll("(?i)\\brape\\b", "R-word");
-        return URL.matcher(safeReason).replaceAll("$1 ://$2 dot $3$4");
+    /**
+     * Makes a server-provided reason safe for public chat: words the chat filter blocks are
+     * redacted and links are broken up so they are not treated as advertising.
+     */
+    static String safeReason(String reason) {
+        if (reason == null || reason.isBlank()) {
+            return "No reason listed";
+        }
+        String safe = reason.replaceAll("(?i)\\brape\\b", "R-word");
+        // PikaNetwork's filter blocks links, even spelled out ("prnt dot sc"), so drop them entirely.
+        safe = URL.matcher(safe).replaceAll("[link]");
+        safe = DOMAIN.matcher(safe).replaceAll("[link]");
+        safe = safe.replaceAll("(?i)\\b[a-z0-9-]{2,}\\s+dot\\s+[a-z]{2,6}\\b", "[link]");
+        safe = safe.replaceAll("(?i)\\b(prnt|imgur|youtu|lunr|gyazo|discord)\\.?\\s*[a-z]{0,3}\\b", "[link]")
+                .replaceAll("\\s{2,}", " ").strip();
+        return safe; // Long reasons are split over several messages by Reply.
     }
 
-    record Entry(String type, String date, String reason) {
-        String compactText() {
-            return date.isBlank() ? type : type + " " + date;
-        }
+    record Entry(String type, String date, String reason, String expires, boolean active) {
     }
 }
