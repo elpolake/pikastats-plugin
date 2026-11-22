@@ -969,6 +969,187 @@ def write_shortcut(link: Path, target: Path, working_dir: Path, description: str
     link.write_bytes(data)
 
 
+HOW_TO_PLAY = [
+    "Start ViaProxy + overlay from the launcher (key o).",
+    "In the ViaProxy window: open Accounts and add your Minecraft account, then on General check the "
+    "server is play.pika-network.net and press Start.",
+    "In Minecraft, join the server localhost:25568.",
+    "Type -help in chat.",
+]
+
+
+# ----------------------------------------------------------------------------- setup windows
+# After the install steps the setup asks nothing more in its console window: on some PCs that console
+# stopped taking keys once Java/ViaProxy/pip had run in it. These small windows avoid it.
+
+GUI_BG, GUI_CARD, GUI_TEXT, GUI_DIM, GUI_ACCENT, GUI_BAD = "#0d1117", "#161b22", "#e6edf3", "#8b949e", "#00d27a", "#f85149"
+
+
+def gui_available() -> bool:
+    try:
+        import tkinter
+        root = tkinter.Tk()
+        root.destroy()
+        return True
+    except Exception:  # noqa: BLE001 - no tkinter or no display: use the console instead
+        return False
+
+
+def gui_root(title: str):
+    import tkinter as tk
+    root = tk.Tk()
+    root.title(title)
+    root.configure(bg=GUI_BG, padx=22, pady=18)
+    root.resizable(False, False)
+    root.attributes("-topmost", True)  # stays visible next to a windowed Minecraft
+    return root
+
+
+def gui_button(parent, text: str, command, primary: bool = False):
+    import tkinter as tk
+    return tk.Button(parent, text=text, command=command, relief="flat", cursor="hand2", padx=14, pady=6,
+                     font=("Segoe UI", 10, "bold"), bd=0,
+                     bg=GUI_ACCENT if primary else GUI_CARD, fg=GUI_BG if primary else GUI_TEXT,
+                     activebackground=GUI_ACCENT, activeforeground=GUI_BG)
+
+
+def gui_show(root) -> None:
+    root.update_idletasks()
+    x = (root.winfo_screenwidth() - root.winfo_width()) // 2
+    y = (root.winfo_screenheight() - root.winfo_height()) // 3
+    root.geometry(f"+{x}+{y}")
+    root.lift()
+    root.focus_force()
+    flash_window()
+
+
+def setup_key_window(settings: dict) -> None:
+    """Asks for the PikaNetwork API key in a small window; also picks a copied key up by itself."""
+    import threading
+    import tkinter as tk
+    keys = api_keys(settings)
+    root = gui_root("PikaStats setup - API key")
+    state = {"busy": False, "seen": set(keys), "timer": None}
+
+    def close() -> None:
+        if state["timer"] is not None:
+            root.after_cancel(state["timer"])
+        root.destroy()
+
+    tk.Label(root, text="PikaNetwork API key", bg=GUI_BG, fg=GUI_TEXT, font=("Segoe UI", 15, "bold")).pack(anchor="w")
+    tk.Label(root, text="1. Join play.pika-network.net and type /apikey in chat.\n"
+                        "2. Copy the key (Ctrl+C) - this window picks it up by itself.\n"
+                        "    Or paste it below and press Save.",
+             bg=GUI_BG, fg=GUI_DIM, justify="left", font=("Segoe UI", 10)).pack(anchor="w", pady=(6, 10))
+    entry = tk.Entry(root, width=48, font=("Consolas", 11), bg=GUI_CARD, fg=GUI_TEXT, insertbackground=GUI_TEXT,
+                     relief="flat", highlightthickness=1, highlightbackground="#30363d", highlightcolor=GUI_ACCENT)
+    entry.pack(fill="x", ipady=6)
+    status = tk.Label(root, text="Waiting for your key..." if not keys else f"{len(keys)} key(s) already saved.",
+                      bg=GUI_BG, fg=GUI_DIM, font=("Segoe UI", 10), anchor="w", justify="left", wraplength=420)
+    status.pack(fill="x", pady=(8, 12))
+    row = tk.Frame(root, bg=GUI_BG)
+    row.pack(fill="x")
+
+    def set_status(text: str, color: str = GUI_DIM) -> None:
+        status.configure(text=text, fg=color)
+
+    def clipboard() -> str:
+        try:
+            return root.clipboard_get()
+        except tk.TclError:
+            return ""
+
+    def try_key(value: str) -> None:
+        value = value.strip().strip('"')
+        if state["busy"] or not value:
+            return
+        if len(value) < 8 or " " in value:
+            set_status("That does not look like an API key.", GUI_BAD)
+            return
+        state["busy"] = True
+        state["seen"].add(value)
+        set_status("Checking the key with PikaNetwork...")
+
+        def work() -> None:
+            result = test_api_key(value)
+            root.after(0, lambda: finished(value, result))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def finished(value: str, result: str) -> None:
+        state["busy"] = False
+        if result == "invalid":
+            set_status("PikaNetwork rejected that key. Check it and try again.", GUI_BAD)
+            return
+        if value not in keys:
+            keys.append(value)
+        write_api_keys(settings, keys)
+        set_status(f"Key saved ({result}). Continuing...", GUI_ACCENT)
+        root.after(1300, close)
+
+    def paste() -> None:
+        text = clipboard()
+        match = API_KEY_PATTERN.search(text)
+        entry.delete(0, "end")
+        entry.insert(0, match.group(0) if match else text.strip()[:80])
+        try_key(entry.get())
+
+    def poll() -> None:
+        if not state["busy"]:
+            match = API_KEY_PATTERN.search(clipboard())
+            if match and match.group(0) not in state["seen"]:
+                entry.delete(0, "end")
+                entry.insert(0, match.group(0))
+                flash_window()
+                try_key(match.group(0))
+        state["timer"] = root.after(500, poll)
+
+    gui_button(row, "Save key", lambda: try_key(entry.get()), primary=True).pack(side="left")
+    gui_button(row, "Paste", paste).pack(side="left", padx=8)
+    gui_button(row, "Skip for now" if not keys else "Continue", close).pack(side="right")
+    root.protocol("WM_DELETE_WINDOW", close)
+    entry.bind("<Return>", lambda event: try_key(entry.get()))
+    gui_show(root)
+    entry.focus_set()
+    state["timer"] = root.after(300, poll)
+    root.mainloop()
+
+
+def setup_done_window() -> bool:
+    """'PikaStats is installed' with the how-to; True when the player wants the launcher now."""
+    import tkinter as tk
+    root = gui_root("PikaStats is installed")
+    choice = {"open": False}
+    tk.Label(root, text="PikaStats is installed!", bg=GUI_BG, fg=GUI_ACCENT,
+             font=("Segoe UI", 15, "bold")).pack(anchor="w")
+    tk.Label(root, text="A PikaStats shortcut is on your desktop and in the Start menu.", bg=GUI_BG, fg=GUI_DIM,
+             font=("Segoe UI", 10)).pack(anchor="w", pady=(4, 10))
+    for number, step in enumerate(HOW_TO_PLAY, 1):
+        tk.Label(root, text=f"{number}.  {step}", bg=GUI_BG, fg=GUI_TEXT, font=("Segoe UI", 10), justify="left",
+                 wraplength=440).pack(anchor="w", pady=2)
+    row = tk.Frame(root, bg=GUI_BG)
+    row.pack(fill="x", pady=(14, 0))
+
+    def open_launcher() -> None:
+        choice["open"] = True
+        root.destroy()
+
+    gui_button(row, "Open launcher", open_launcher, primary=True).pack(side="left")
+    gui_button(row, "Close", root.destroy).pack(side="right")
+    gui_show(root)
+    root.mainloop()
+    return choice["open"]
+
+
+def open_launcher_window() -> None:
+    """Starts the launcher in its own new console window (never in the setup's console)."""
+    starter = ROOT / "Start PikaStats.bat"
+    if WINDOWS and starter.exists():
+        subprocess.Popen(["cmd", "/c", str(starter), "--fast"], cwd=ROOT, creationflags=subprocess.CREATE_NEW_CONSOLE)
+    else:
+        subprocess.Popen([sys.executable, str(ROOT / "launcher.py"), "--fast"], cwd=ROOT)
+
+
 def run_setup(source: Path, theme: Theme) -> int:
     """First-time setup wizard, started by 'Install PikaStats.bat' from the setup package folder."""
     global ROOT, SETTINGS_FILE, STATE_FILE
@@ -1040,12 +1221,24 @@ def run_setup(source: Path, theme: Theme) -> int:
             return 1
         save_settings(settings)
     rule(theme, f"STEP {len(steps) + 1}/{len(steps) + 2} :: API KEY")
-    api_keys_menu(settings, theme, first_run=True)
+    use_windows = gui_available()
+    if use_windows:
+        print(f"  {theme.main}[>]{RESET} a small window asks for your API key (it may be behind other windows)")
+        setup_key_window(settings)
+        count = len(api_keys(settings))
+        print(f"  {GREEN + f'[✓] {count} API key(s) saved' if count else YELLOW + '[!] no API key yet - add one later (launcher key a)'}{RESET}")
+    else:
+        api_keys_menu(settings, theme, first_run=True)
     rule(theme, f"STEP {len(steps) + 2}/{len(steps) + 2} :: SHORTCUTS")
     write_start_files(settings)
     (ROOT / ".pikastats-installed").write_text(VERSION + "\n", encoding="utf-8")
     save_settings(settings)
     print(f"  {GREEN}[✓]{RESET} desktop + Start menu shortcut: {BOLD}PikaStats{RESET}")
+    if use_windows:
+        print(f"\n  {GREEN}{BOLD}PikaStats is installed!{RESET} {GRAY}(this window closes by itself){RESET}")
+        if setup_done_window():
+            open_launcher_window()
+        return 0
     print(f"""
   {GREEN}{BOLD}PikaStats is installed!{RESET}
   How to play:
