@@ -846,12 +846,46 @@ def write_start_files(settings: dict) -> None:
     targets = [Path(os.environ.get("USERPROFILE", Path.home())) / "Desktop" / "PikaStats.lnk",
                Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs/PikaStats.lnk"]
     for link in targets:
-        if not link.parent.exists():
-            continue
-        script = (f"$s=(New-Object -ComObject WScript.Shell).CreateShortcut('{link}');"
-                  f"$s.TargetPath='{starter}';$s.WorkingDirectory='{ROOT}';"
-                  f"$s.Description='PikaStats launcher';$s.Save()")
-        subprocess.run(["powershell", "-NoProfile", "-Command", script], capture_output=True)
+        if link.parent.exists():
+            try:
+                write_shortcut(link, starter, ROOT, "PikaStats launcher")
+            except OSError as error:
+                print(f"  {YELLOW}[!]{RESET} could not create {link.name} in {link.parent}: {error}")
+
+
+def write_shortcut(link: Path, target: Path, working_dir: Path, description: str) -> None:
+    """Writes a Windows .lnk file directly (MS-SHLLINK format), without PowerShell or COM."""
+    import struct
+
+    def string_data(text: str) -> bytes:
+        return struct.pack("<H", len(text)) + text.encode("utf-16-le")
+
+    # LinkInfo with VolumeID + local path; the Unicode path fields (header size 0x24) keep any user name intact.
+    ansi_path = str(target).encode("mbcs", errors="replace") + b"\0" if WINDOWS else str(target).encode() + b"\0"
+    unicode_path = str(target).encode("utf-16-le") + b"\0\0"
+    volume_id = struct.pack("<IIII", 17, 3, 0, 0x10) + b"\0"  # size, DRIVE_FIXED, serial, label offset, ""
+    header_size = 0x24
+    volume_offset = header_size
+    path_offset = volume_offset + len(volume_id)
+    suffix_offset = path_offset + len(ansi_path)
+    unicode_offset = suffix_offset + 1
+    unicode_suffix_offset = unicode_offset + len(unicode_path)
+    link_info_size = unicode_suffix_offset + 2
+    link_info = struct.pack("<IIIIIIIII", link_info_size, header_size, 0x1, volume_offset, path_offset, 0,
+                            suffix_offset, unicode_offset, unicode_suffix_offset)
+    link_info += volume_id + ansi_path + b"\0" + unicode_path + b"\0\0"
+
+    flags = 0x2 | 0x4 | 0x10 | 0x80 | 0x200  # HasLinkInfo, HasName, HasWorkingDir, IsUnicode, HasExpString
+    header = struct.pack("<I16sII8s8s8sIIIHHII", 0x4C,
+                         bytes.fromhex("0114020000000000c000000000000046"),
+                         flags, 0x20, b"\0" * 8, b"\0" * 8, b"\0" * 8, 0, 0, 1, 0, 0, 0, 0)
+    # EnvironmentVariableDataBlock: the target path Explorer resolves the shortcut with.
+    target_ansi = (str(target).encode("mbcs", errors="replace") if WINDOWS else str(target).encode())[:259]
+    target_wide = str(target).encode("utf-16-le")[:518]
+    env_block = struct.pack("<II", 0x314, 0xA0000001) + target_ansi.ljust(260, b"\0") + target_wide.ljust(520, b"\0")
+    data = (header + link_info + string_data(description) + string_data(str(working_dir)) + env_block
+            + b"\0\0\0\0")
+    link.write_bytes(data)
 
 
 def run_setup(source: Path, theme: Theme) -> int:

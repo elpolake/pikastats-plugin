@@ -6,3 +6,5 @@ libs/*.jar
 .env
 .env.*
 overlay.properties
+__pycache__/
+*.pyc
