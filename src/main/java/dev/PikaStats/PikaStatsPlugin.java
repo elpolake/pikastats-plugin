@@ -14,7 +14,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
 
 public final class PikaStatsPlugin extends ViaProxyPlugin {
-    static final String VERSION = "2.3.4";
+    static final String VERSION = "2.3.5";
 
     private ExecutorService executor;
     private PikaStatsListener listener;

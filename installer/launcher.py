@@ -12,6 +12,7 @@ import random
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -381,6 +382,45 @@ def tier_color(value: float, scale: float = 1.0) -> str:
     return GRAY
 
 
+# Python checks HTTPS against the root certificates Windows has already stored; Windows itself fetches
+# missing ones only when a browser or Windows needs them. On such PCs Python reports
+# CERTIFICATE_VERIFY_FAILED, so we fall back to Windows' own curl.exe (Schannel), which fetches them.
+CURL = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "curl.exe"
+_curl_note_shown = False
+
+
+def is_cert_error(error: BaseException) -> bool:
+    reason = getattr(error, "reason", error)
+    return isinstance(reason, ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in str(error)
+
+
+def can_use_curl(error: BaseException) -> bool:
+    global _curl_note_shown
+    if not (WINDOWS and CURL.exists() and is_cert_error(error)):
+        return False
+    if not _curl_note_shown:
+        _curl_note_shown = True
+        print(f"  {GRAY}[~] Python's HTTPS certificate check failed on this PC - using Windows' curl instead{RESET}")
+    return True
+
+
+def curl_get(url: str, headers: dict, timeout: int) -> tuple[int, bytes]:
+    """(HTTP status, body) via curl.exe; status 0 when there was no answer."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as folder:
+        body = Path(folder) / "body"
+        args = [str(CURL), "-sS", "-L", "--ssl-revoke-best-effort", "--max-time", str(timeout),
+                "-o", str(body), "-w", "%{http_code}"]
+        for name, value in headers.items():
+            args += ["-H", f"{name}: {value}"]
+        try:
+            result = subprocess.run(args + [url], capture_output=True, text=True, timeout=timeout + 10)
+        except (OSError, subprocess.SubprocessError):
+            return 0, b""
+        status = int(result.stdout.strip()[-3:]) if result.stdout.strip()[-3:].isdigit() else 0
+        return status, body.read_bytes() if body.exists() else b""
+
+
 def api_get(url: str, key: str) -> tuple[int, dict | None]:
     request = urllib.request.Request(url, headers={"X-Api-Key": key, "User-Agent": "PikaStats-Launcher/2.0",
                                                    "Accept": "application/json"})
@@ -389,8 +429,14 @@ def api_get(url: str, key: str) -> tuple[int, dict | None]:
             return response.status, json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
         return error.code, None
-    except (urllib.error.URLError, TimeoutError, ValueError):
-        return 0, None
+    except (urllib.error.URLError, TimeoutError, ValueError) as error:
+        if not can_use_curl(error):
+            return 0, None
+        status, body = curl_get(url, dict(request.header_items()), 12)
+        try:
+            return status, json.loads(body.decode("utf-8")) if status == 200 else None
+        except ValueError:
+            return status, None
 
 
 def api_keys(settings: dict) -> list[str]:
@@ -573,12 +619,18 @@ USER_AGENT = {"User-Agent": "PikaStats-Setup/" + VERSION}
 
 
 def http_json(url: str) -> dict | None:
+    headers = {**USER_AGENT, "Accept": "application/json"}
     try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers={**USER_AGENT, "Accept": "application/json"}),
-                                    timeout=20) as response:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=20) as response:
             return json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, ValueError):
-        return None
+    except (urllib.error.URLError, TimeoutError, ValueError) as error:
+        if not can_use_curl(error):
+            return None
+        status, body = curl_get(url, headers, 20)
+        try:
+            return json.loads(body.decode("utf-8")) if status == 200 else None
+        except ValueError:
+            return None
 
 
 def download(url: str, target: Path, label: str, theme: Theme) -> bool:
@@ -618,9 +670,29 @@ def download_once(url: str, target: Path, label: str, theme: Theme) -> bool:
         partial.replace(target)
         return True
     except (urllib.error.URLError, TimeoutError, OSError) as error:
-        print(f"\n  {RED}[x]{RESET} download failed: {error}")
         partial.unlink(missing_ok=True)
+        if can_use_curl(error):
+            return curl_download(url, target, label)
+        print(f"\n  {RED}[x]{RESET} download failed: {error}")
         return False
+
+
+def curl_download(url: str, target: Path, label: str) -> bool:
+    """Downloads with Windows' curl.exe (its own progress bar)."""
+    partial = target.with_name(target.name + ".part")
+    print(f"  {GRAY}{label}{RESET}")
+    args = [str(CURL), "-L", "--fail", "--ssl-revoke-best-effort", "--retry", "2", "--connect-timeout", "30",
+            "-#", "-o", str(partial), "-H", f"User-Agent: {USER_AGENT['User-Agent']}", url]
+    try:
+        ok = subprocess.run(args).returncode == 0 and partial.exists() and partial.stat().st_size > 0
+    except OSError:
+        ok = False
+    if ok:
+        partial.replace(target)
+        return True
+    partial.unlink(missing_ok=True)
+    print(f"  {RED}[x]{RESET} download failed (also with Windows' curl)")
+    return False
 
 
 def java_major(java: str) -> int:
